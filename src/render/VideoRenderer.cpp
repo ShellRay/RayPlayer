@@ -531,3 +531,140 @@ void VideoRenderer::release() {
 }
 
 } // namespace player_sdk
+
+//看了你的代码，这段是一个 Android 上用 OpenGL ES 渲染 YUV 视频帧 的 C++ 实现。你觉得绕很正常，因为它把 EGL（OpenGL 和系统窗口之间的"桥梁"）和 OpenGL 渲染管线全揉在一起了。
+
+// 第一条线： EGL 初始化（搭建舞台）
+//
+// initEgl() 做的事情，类比成"搭一个舞台准备演戏"：
+// 步骤   代码   人话
+// ① 拿到显示器   eglGetDisplay   找到屏幕（就像找到一块画布）
+//
+// ② 启动 EGL   eglInitialize   初始化 OpenGL ES 环境
+//
+// ③ 选配置   eglChooseConfig   告诉系统"我要 OpenGL ES 2.0 + 窗口类型"
+//
+// ④ 创建上下文   eglCreateContext   创建"画笔"（GL 上下文，后续所有绘制操作都靠它）
+//
+// ⑤ 创建表面   eglCreateWindowSurface   把 ANativeWindow（Surface）绑定到 EGL，告诉 OpenGL"画到哪个窗口上"
+//
+// ⑥ 绑定上下文到线程   eglMakeCurrent   把画笔交给当前线程，之后这个线程就能画了
+//
+// ⑦ 关 VSync   eglSwapInterval(0)   关掉屏幕刷新同步，让播放器自己控制帧率（避免双重限流导致卡顿）
+//
+// 关键理解：EGL 就是 OpenGL 和 Android 窗口系统之间的"翻译官"。OpenGL 本身不知道 Android 的 Surface 是什么，EGL 负责把它们连起来。
+//
+// 第二条线： GL 初始化（准备颜料和画板）
+//
+// initGl() 做的事情：
+//
+// 编译着色器（Shader）：把顶点着色器和片元着色器的 GLSL 代码交给 GPU 编译
+// 链接程序：把两个着色器连成一个可执行的 GPU 程序
+// 创建 3 个纹理对象：m_texY、m_texU、m_texV，对应 YUV 的 Y、U、V 三个分量
+// 设置纹理参数：线性滤波 + 边缘夹紧（防止纹理拉伸时出现杂色）
+//
+// 关键理解：这时候 GPU 已经准备好了"怎么画"（着色器）和"画在哪"（纹理对象），但还没有实际数据。
+//
+// 第三条线： 渲染一帧（真正作画）
+//
+// render() 是核心，每来一帧视频数据就走一遍。按顺序拆：
+//
+// Step 1：激活上下文
+// eglMakeCurrent(...)  // 让当前线程拿到画笔
+//
+// Step 2：解析 YUV 数据内存布局
+// YUV420 Planar(I420) 内存排列：
+// ┌──────────────────────────────┐
+// │ YYYYYYYY...  (width×height)   │  ← yPlane
+// │ UUUU...        (w/2×h/2)      │  ← uPlane
+// │ VVVV...        (w/2×h/2)      │  ← vPlane
+// └──────────────────────────────┘
+//
+// 代码里用指针偏移找到三个平面的起始地址：
+// yPlane = frame.yuv.data() —— Y 平面从头开始
+// uPlane = yPlane + width×height —— U 平面在 Y 后面
+// vPlane = yPlane + width×height×5/4 —— V 平面在 U 后面（因为 U 占了 width×height×1/4 的空间）
+//
+// Step 3：把数据上传到 GPU 纹理
+// glActiveTexture(GL_TEXTURE0);  // 选第0号纹理单元
+// glBindTexture(GL_TEXTURE_2D, m_texY);  // 绑定Y纹理
+// glTexImage2D(...);  // 把Y平面数据拷贝到GPU显存
+//
+// // U、V 同理，但分辨率是半宽半高
+//
+// 关键理解：glTexImage2D 是把 CPU 内存的数据拷贝到 GPU 显存的过程。Y 是全分辨率，U/V 是半分辨率（因为 420 格式里 U/V 采样率是 Y 的一半）。
+//
+// Step 4：告诉 GPU 怎么画
+// glUseProgram(m_program);           // 启用我们编译好的着色器程序
+// glUniform1i(...texY..., 0);        // 告诉着色器：texY 用纹理单元0
+// glUniform1i(...texU..., 1);        // texU 用纹理单元1
+// glUniform1i(...texV..., 2);        // texV 用纹理单元2
+//
+// glVertexAttribPointer(0, ...);     // 设置顶点位置属性（4个角）
+// glVertexAttribPointer(1, ...);     // 设置纹理坐标属性
+// glEnableVertexAttribArray(0, 1);   // 启用这两个属性
+//
+// glClear(GL_COLOR_BUFFER_BIT);      // 清屏
+// glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);  // 画一个四边形（覆盖整个屏幕）
+//
+// 关键理解：这里画的是一个全屏四边形（4个顶点：左上、右上、左下、右下），GPU 会自动填充四边形内部的像素——填充时就会执行片元着色器里的 YUV→RGB 转换公式。
+//
+// Step 5：交换缓冲区（显示出来）
+// eglSwapBuffers(display, surface);  // 把 GPU 画好的内容显示到屏幕上
+//
+// 关键理解：OpenGL 用的是双缓冲——GPU 在前缓冲区（Back Buffer）画，画完了调用 swapBuffers 把前后缓冲区交换，用户就看到新画面了。
+//
+// 第四条线： 片元着色器（YUV→RGB 的核心魔法）
+//
+// 这才是视频渲染最核心的部分。着色器里做的事情：
+//
+// // 1. 翻转Y坐标（OpenGL纹理坐标原点在左下角，视频数据从上往下存）
+// vec2 texCoord = vec2(vTex.x, 1.0 - vTex.y);
+//
+// // 2. 从3个纹理采样Y、U、V值
+// float y = texture2D(texY, texCoord).r * 255.0;
+// float u = texture2D(texU, texCoord).r * 255.0;
+// float v = texture2D(texV, texCoord).r * 255.0;
+//
+// // 3. YUV → RGB 转换公式（ITU-R BT.601 标准）
+// float r = y + 1.402 * (v - 128.0);
+// float g = y + (-0.344136) * (u - 128.0) + (-0.714136) * (v - 128.0);
+// float b = y + 1.772 * (u - 128.0);
+//
+// // 4. 钳制到合法范围并输出
+// gl_FragColor = vec4(clamp(r,0,255)/255.0, clamp(g,0,255)/255.0, clamp(b,0,255)/255.0, 1.0);
+//
+// 关键理解：
+// 视频数据存的是 YUV 格式（亮度+色度分离，节省带宽）
+// 屏幕需要的是 RGB 格式（红绿蓝三色）
+// 着色器就是做格式转换的，而且是在 GPU 上并行做（每个像素同时算）
+// 1.402、0.344136、1.772 这些数字是 ITU-R BT.601 标准里的转换系数，面试可以提一句"用的是 BT.601 标准"
+//
+// 整体流程图（面试可以画这个）
+//
+// 解码器输出 YUV帧
+//     ↓
+// CPU 内存 (YUV420 Planar)
+//     ↓  glTexImage2D (拷贝到GPU显存)
+// GPU 纹理 (Y纹理 + U纹理 + V纹理)
+//     ↓  glDrawArrays 触发着色器执行
+// GPU 片元着色器 (YUV→RGB 转换)
+//     ↓
+// GPU 帧缓冲区 (Back Buffer)
+//     ↓  eglSwapBuffers (前后缓冲交换)
+// 屏幕显示
+//
+// 面试可能追问的点
+//
+// 为什么用 GPU 做 YUV→RGB 而不是 CPU？
+//    — GPU 并行计算能力远强于 CPU，一帧 1920×1080 有 200 多万个像素要转换，CPU 做会卡顿。
+//
+// 为什么 U/V 是半分辨率？
+//    — 人眼对亮度（Y）更敏感，对色度（U/V）不那么敏感，所以 4:2:0 采样把色度分辨率降一半来节省带宽和存储。
+//
+// glTexImage2D 每帧都调会不会很慢？
+//    — 确实有性能开销。优化方案是用 glTexSubImage2D（只更新变化部分）或者用 EGLImage + OpenGL 共享内存避免拷贝（零拷贝渲染）。
+//
+// 关掉 VSync 有什么风险？
+//    — 可能出现画面撕裂（frame tearing），但播放器场景通常可以接受，因为播放器自己做了帧率控制。
+//
